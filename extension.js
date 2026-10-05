@@ -3,6 +3,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const readline = require("readline");
+const childProcess = require("child_process");
 
 const CODEX_SCHEME = "openai-codex";
 const CODEX_AUTHORITY = "route";
@@ -198,14 +199,260 @@ async function readLatestRateLimits(files) {
   return best;
 }
 
+// ---- Live limits from the local `codex app-server` (experimental OpenAI protocol) ----
+
+const LIVE_TIMEOUT_MS = 8000;
+const LIVE_REFRESH_MS = 5 * 60_000;
+const LIVE_MAX_AGE_MS = 15 * 60_000;
+
+function normalizeWindow(window) {
+  if (!window || typeof window !== "object") return null;
+  const used = Number(window.usedPercent);
+  if (window.usedPercent == null || !Number.isFinite(used)) return null;
+  const resets = Number(window.resetsAt);
+  const minutes = Number(window.windowDurationMins);
+  return {
+    used_percent: used,
+    resets_at: Number.isFinite(resets) && resets > 0 ? resets : null,
+    window_min: Number.isFinite(minutes) && minutes > 0 ? minutes : null,
+  };
+}
+
+// Same shape as `rate_limits` in the local jsonl records, so one renderer serves both sources.
+function normalizeBucket(bucket) {
+  if (!bucket || typeof bucket !== "object") return null;
+  const primary = normalizeWindow(bucket.primary);
+  const secondary = normalizeWindow(bucket.secondary);
+  if (!primary && !secondary) return null;
+  return {
+    plan_type: typeof bucket.planType === "string" ? bucket.planType : null,
+    primary,
+    secondary,
+  };
+}
+
+// Prefer rateLimitsByLimitId.codex, then any other usable bucket there, then the legacy rateLimits.
+function pickBucket(result) {
+  if (!result || typeof result !== "object") return null;
+  const byId = result.rateLimitsByLimitId;
+  if (byId && typeof byId === "object") {
+    const preferred = normalizeBucket(byId.codex);
+    if (preferred) return preferred;
+    for (const bucket of Object.values(byId)) {
+      const normalized = normalizeBucket(bucket);
+      if (normalized) return normalized;
+    }
+  }
+  return normalizeBucket(result.rateLimits);
+}
+
+function parseExtensionVersion(name) {
+  const match = /^openai\.chatgpt-(\d+(?:\.\d+)*)/.exec(name || "");
+  return match ? match[1].split(".").map(Number) : null;
+}
+
+function compareVersions(a, b) {
+  const length = Math.max(a.length, b.length);
+  for (let i = 0; i < length; i++) {
+    const diff = (a[i] || 0) - (b[i] || 0);
+    if (diff) return diff;
+  }
+  return 0;
+}
+
+// Extension folders, newest version first (numeric compare: 26.10 > 26.9).
+function sortExtensionDirs(names) {
+  return names
+    .map((name) => ({ name, version: parseExtensionVersion(name) }))
+    .filter((entry) => entry.version)
+    .sort((a, b) => compareVersions(b.version, a.version))
+    .map((entry) => entry.name);
+}
+
+function platformBinDirs(platform, arch) {
+  const cpu = arch === "arm64" ? ["aarch64", "arm64"] : ["x86_64", "x64"];
+  const systems = platform === "win32" ? ["windows"] : platform === "darwin" ? ["macos", "darwin"] : ["linux"];
+  return systems.flatMap((name) => cpu.map((c) => `${name}-${c}`));
+}
+
+function binaryName(platform) {
+  return platform === "win32" ? "codex.exe" : "codex";
+}
+
+// Pure choice: the newest extension folder plus candidate platform folders and binary name.
+function pickCodexBinary(dirNames, platform, arch) {
+  const [newest] = sortExtensionDirs(dirNames);
+  if (!newest) return null;
+  return { dirName: newest, platformDirs: platformBinDirs(platform, arch), binary: binaryName(platform) };
+}
+
+function findCodexBinary(extensionPath) {
+  if (!extensionPath) return null;
+  const root = path.dirname(extensionPath);
+  let names;
+  try {
+    names = fs.readdirSync(root);
+  } catch {
+    return null;
+  }
+  // The active extension first; the newest other folders only as a fallback if its binary is missing.
+  const active = path.basename(extensionPath);
+  const order = [active, ...sortExtensionDirs(names).filter((name) => name !== active).slice(0, 2)];
+  for (const dirName of order) {
+    const choice = pickCodexBinary([dirName], process.platform, process.arch);
+    for (const platformDir of choice.platformDirs) {
+      const dir = path.join(root, dirName, "bin", platformDir);
+      const candidates = [];
+      try {
+        const entry = JSON.parse(fs.readFileSync(path.join(dir, "codex-package.json"), "utf8")).entrypoint;
+        if (typeof entry === "string" && entry) {
+          candidates.push(path.join(dir, entry), path.join(dir, path.basename(entry)));
+        }
+      } catch {
+        // No manifest: use the default name below.
+      }
+      candidates.push(path.join(dir, choice.binary));
+      for (const candidate of candidates) {
+        // Never leave the extension folder through a crafted entrypoint.
+        if (!path.resolve(candidate).startsWith(path.resolve(root, dirName) + path.sep)) continue;
+        try {
+          if (fs.statSync(candidate).isFile()) return candidate;
+        } catch {
+          // try next
+        }
+      }
+    }
+  }
+  return null;
+}
+
+// Asks the official extension's `codex app-server` over stdio JSON-RPC. No tokens are passed,
+// auth.json is not read. Always kills the child. Returns { promise, kill }.
+function fetchLiveRateLimits(binary, timeoutMs = LIVE_TIMEOUT_MS) {
+  let kill = () => {};
+  const promise = new Promise((resolve, reject) => {
+    let settled = false;
+    let timer;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      kill();
+      if (error) reject(error);
+      else resolve(value);
+    };
+    let child;
+    try {
+      child = childProcess.spawn(binary, ["app-server"], { stdio: ["pipe", "pipe", "ignore"], windowsHide: true, cwd: os.homedir() });
+    } catch (error) {
+      settled = true;
+      reject(error);
+      return;
+    }
+    kill = () => {
+      try {
+        child.kill();
+      } catch {
+        // already gone
+      }
+    };
+    timer = setTimeout(() => finish(new Error("timeout")), timeoutMs);
+    child.on("error", (error) => finish(error));
+    child.on("exit", () => finish(new Error("app-server exited")));
+    child.stdin.on("error", () => {});
+    const send = (message) => {
+      try {
+        child.stdin.write(JSON.stringify(message) + "\n");
+      } catch {
+        // surfaced by timeout/exit
+      }
+    };
+    let buffer = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      buffer += chunk;
+      if (buffer.length > 4 * 1024 * 1024) return finish(new Error("response too large"));
+      let index;
+      while ((index = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, index);
+        buffer = buffer.slice(index + 1);
+        let message;
+        try {
+          message = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (!message || typeof message !== "object") continue;
+        if (message.id === 1) {
+          if (message.error) return finish(new Error("initialize failed"));
+          send({ method: "initialized" });
+          send({ id: 2, method: "account/rateLimits/read" });
+        } else if (message.id === 2) {
+          if (message.error) return finish(new Error("rateLimits failed"));
+          let bucket = null;
+          try {
+            bucket = pickBucket(message.result);
+          } catch {
+            // reported below
+          }
+          return bucket ? finish(null, bucket) : finish(new Error("no limits in response"));
+        }
+      }
+    });
+    send({
+      id: 1,
+      method: "initialize",
+      params: {
+        clientInfo: { name: "codex-project-sessions", title: "Codex Project Sessions", version: "0.9.0" },
+        capabilities: { experimentalApi: true },
+      },
+    });
+  });
+  return { promise, kill: () => kill() };
+}
+
+function liveSourceLabel(time) {
+  const age = relativeAge(time);
+  return age === "now" ? "Live from Codex · updated just now" : `Live from Codex · updated ${age} ago`;
+}
+
 class UsageProvider {
   constructor() {
     this.changed = new vscode.EventEmitter();
     this.onDidChangeTreeData = this.changed.event;
+    this.cache = null; // last successful live answer: { limits, time }
+    this.current = null; // in-flight request: { promise, kill }
+  }
+
+  liveEnabled() {
+    return vscode.workspace.getConfiguration("codexProjectSessions").get("liveUsage", true) !== false;
   }
 
   refresh() {
     this.changed.fire();
+  }
+
+  // One request at a time; a second call while one runs just joins it.
+  async refreshLive() {
+    if (!this.liveEnabled()) return;
+    if (this.current) return this.current.promise.then(() => {}, () => {});
+    const binary = findCodexBinary(vscode.extensions.getExtension("openai.chatgpt")?.extensionPath);
+    if (!binary) return;
+    const request = fetchLiveRateLimits(binary);
+    this.current = request;
+    try {
+      this.cache = { limits: await request.promise, time: Date.now() };
+    } catch {
+      // Keep the previous cache; the panel falls back to local data once it is too old.
+    } finally {
+      request.kill();
+      this.current = null;
+      this.changed.fire();
+    }
+  }
+
+  dispose() {
+    this.current?.kill();
   }
 
   getTreeItem(item) {
@@ -213,23 +460,42 @@ class UsageProvider {
   }
 
   async getChildren() {
-    const files = await listJsonlFiles(path.join(os.homedir(), ".codex", "sessions"));
-    const latest = await readLatestRateLimits(files);
-    if (!latest) {
-      const item = new vscode.TreeItem("Usage will appear after the first request");
-      item.iconPath = new vscode.ThemeIcon("info");
-      return [item];
+    let limits;
+    let time;
+    let live = false;
+    if (this.liveEnabled() && this.cache && Date.now() - this.cache.time < LIVE_MAX_AGE_MS) {
+      ({ limits, time } = this.cache);
+      live = true;
+    } else {
+      const files = await listJsonlFiles(path.join(os.homedir(), ".codex", "sessions"));
+      const latest = await readLatestRateLimits(files);
+      if (!latest) {
+        const item = new vscode.TreeItem("Usage will appear after the first request");
+        item.iconPath = new vscode.ThemeIcon("info");
+        return [item];
+      }
+      ({ limits, time } = latest);
     }
-    const { limits, time } = latest;
     const plan = new vscode.TreeItem(`Account: ${limits.plan_type || "Codex"}`);
     plan.iconPath = new vscode.ThemeIcon("account");
     plan.command = { command: "codexProjectSessions.openAccount", title: "View details" };
     const updated = new vscode.TreeItem(" ");
-    updated.description = time ? `Local data from ${relativeAge(time)} ago` : "Local data, time unknown";
-    updated.tooltip = "Codex saves limits locally only after a request from this computer. Usage from other devices or apps is not visible here until your next request.";
-    updated.iconPath = new vscode.ThemeIcon("history");
+    if (live) {
+      updated.description = liveSourceLabel(time);
+      updated.tooltip = "Asked from the local Codex app-server of the official extension (experimental protocol). Refreshed when this panel opens and every 5 minutes while it is visible.";
+      updated.iconPath = new vscode.ThemeIcon("pulse");
+    } else {
+      updated.description = time ? `Local data from ${relativeAge(time)} ago` : "Local data, time unknown";
+      updated.tooltip = "Codex saves limits locally only after a request from this computer. Usage from other devices or apps is not visible here until your next request.";
+      updated.iconPath = new vscode.ThemeIcon("history");
+    }
     const makeLimit = (label, value) => {
-      const expired = value?.resets_at && value.resets_at * 1000 <= Date.now();
+      if (!value) {
+        const empty = new vscode.TreeItem(`${label}  no data`);
+        empty.iconPath = new vscode.ThemeIcon("circle-outline");
+        return [empty];
+      }
+      const expired = value.resets_at && value.resets_at * 1000 <= Date.now();
       // Show what is LEFT, like the official Codex usage window does.
       const left = Math.max(0, 100 - Math.round(value?.used_percent || 0));
       const item = new vscode.TreeItem(
@@ -547,15 +813,33 @@ function activate(context) {
   const hiddenIds = new Set(context.globalState.get("hiddenSessionIds", []));
   const provider = new SessionsProvider(context, hiddenIds);
   const usageProvider = new UsageProvider();
+  activeUsageProvider = usageProvider;
+  const usageView = vscode.window.createTreeView("codexProjectSessions.usage", { treeDataProvider: usageProvider });
+  let liveTimer;
+  const stopLiveTimer = () => {
+    clearInterval(liveTimer);
+    liveTimer = undefined;
+  };
+  // Live request on show and every 5 minutes while the panel is visible.
+  const syncLiveTimer = () => {
+    stopLiveTimer();
+    if (!usageView.visible) return;
+    void usageProvider.refreshLive();
+    liveTimer = setInterval(() => void usageProvider.refreshLive(), LIVE_REFRESH_MS);
+  };
+  context.subscriptions.push(usageView.onDidChangeVisibility(syncLiveTimer), { dispose: stopLiveTimer });
+  syncLiveTimer();
   void maybePatch(context);
   context.subscriptions.push(
     provider.changed,
     usageProvider.changed,
+    usageProvider,
     vscode.window.registerTreeDataProvider("codexProjectSessions.sessions", provider),
-    vscode.window.registerTreeDataProvider("codexProjectSessions.usage", usageProvider),
+    usageView,
     vscode.commands.registerCommand("codexProjectSessions.refresh", () => {
       provider.refresh();
       usageProvider.refresh();
+      void usageProvider.refreshLive();
     }),
     vscode.commands.registerCommand("codexProjectSessions.search", async () => {
       const value = await vscode.window.showInputBox({
@@ -630,6 +914,14 @@ function activate(context) {
     }),
     vscode.commands.registerCommand("codexProjectSessions.restoreOfficialExtension", restoreOfficialExtension),
     vscode.workspace.onDidChangeConfiguration((event) => {
+      if (event.affectsConfiguration("codexProjectSessions.liveUsage")) {
+        if (usageProvider.liveEnabled()) syncLiveTimer();
+        else {
+          stopLiveTimer();
+          usageProvider.dispose();
+        }
+        usageProvider.refresh();
+      }
       if (
         event.affectsConfiguration("codexProjectSessions.patchOfficialExtension") &&
         vscode.workspace.getConfiguration("codexProjectSessions").inspect("patchOfficialExtension")?.globalValue === true
@@ -669,7 +961,11 @@ function activate(context) {
   context.subscriptions.push({ dispose: () => clearInterval(ageRefresh) });
 }
 
-function deactivate() {}
+let activeUsageProvider = null;
+
+function deactivate() {
+  activeUsageProvider?.dispose();
+}
 
 module.exports = {
   activate,
@@ -680,4 +976,13 @@ module.exports = {
   resetIn,
   usageBar,
   relativeAge,
+  normalizeBucket,
+  pickBucket,
+  compareVersions,
+  sortExtensionDirs,
+  platformBinDirs,
+  pickCodexBinary,
+  liveSourceLabel,
+  findCodexBinary,
+  fetchLiveRateLimits,
 };

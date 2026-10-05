@@ -2,7 +2,7 @@
   "name": "codex-project-sessions",
   "displayName": "Codex Project Sessions (unofficial)",
   "description": "Unofficial project-scoped Codex sessions list in the VS Code activity bar. Not affiliated with OpenAI.",
-  "version": "0.8.3",
+  "version": "0.9.1",
   "publisher": "community-local",
   "engines": {
     "vscode": "^1.103.0"
@@ -172,6 +172,12 @@
     "configuration": {
       "title": "Codex Project Sessions",
       "properties": {
+        "codexProjectSessions.liveUsage": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "markdownDescription": "Show live Codex limits by asking the local `codex app-server` of the official extension (experimental OpenAI protocol, refreshed every 5 minutes while the panel is visible). Turn off to use only local session records."
+        },
         "codexProjectSessions.patchOfficialExtension": {
           "type": "boolean",
           "default": false,
