@@ -2,6 +2,14 @@
 
 Неофициальное дополнение для VS Code. Оно не связано с OpenAI и не одобрено OpenAI. Работает поверх официального расширения OpenAI Codex (`openai.chatgpt`), которое должно быть установлено. Скриншота нет.
 
+## Переезжаете с Claude Code?
+
+Есть пошаговая инструкция, которую выполняет сам Codex: [PEREEZD.md](PEREEZD.md). Напишите в чат Codex одну строку:
+
+```
+Прочитай https://github.com/akopyanst-star/codex-project-sessions/blob/main/PEREEZD.md и выполни переезд по шагам.
+```
+
 ## Что умеет
 
 - Отдельный значок в левой панели (Activity Bar).
