@@ -162,7 +162,10 @@ async function readLatestRateLimits(files) {
     })
   );
   const recent = stats.filter(Boolean).sort((a, b) => b.mtime - a.mtime);
-  for (const { file } of recent) {
+  // A file's mtime is not the time of its last limits record (an old chat can be reopened),
+  // so scan several recent files and keep the newest record by its own timestamp.
+  let best = null;
+  for (const { file } of recent.slice(0, 30)) {
     let contents;
     try {
       const stat = await fs.promises.stat(file);
@@ -183,14 +186,16 @@ async function readLatestRateLimits(files) {
       try {
         const entry = JSON.parse(line);
         if (entry.type === "event_msg" && entry.payload?.type === "token_count" && entry.payload.rate_limits) {
-          return entry.payload.rate_limits;
+          const time = Date.parse(entry.timestamp) || 0;
+          if (!best || time > best.time) best = { limits: entry.payload.rate_limits, time };
+          break;
         }
       } catch {
         // The first line can be partial because only the tail is read.
       }
     }
   }
-  return null;
+  return best;
 }
 
 class UsageProvider {
@@ -209,29 +214,44 @@ class UsageProvider {
 
   async getChildren() {
     const files = await listJsonlFiles(path.join(os.homedir(), ".codex", "sessions"));
-    const limits = await readLatestRateLimits(files);
-    if (!limits) {
+    const latest = await readLatestRateLimits(files);
+    if (!latest) {
       const item = new vscode.TreeItem("Usage will appear after the first request");
       item.iconPath = new vscode.ThemeIcon("info");
       return [item];
     }
+    const { limits, time } = latest;
     const plan = new vscode.TreeItem(`Account: ${limits.plan_type || "Codex"}`);
     plan.iconPath = new vscode.ThemeIcon("account");
     plan.command = { command: "codexProjectSessions.openAccount", title: "View details" };
+    const updated = new vscode.TreeItem(" ");
+    updated.description = time ? `Local data from ${relativeAge(time)} ago` : "Local data, time unknown";
+    updated.tooltip = "Codex saves limits locally only after a request from this computer. Usage from other devices or apps is not visible here until your next request.";
+    updated.iconPath = new vscode.ThemeIcon("history");
     const makeLimit = (label, value) => {
-      const percent = Math.round(value?.used_percent || 0);
-      const item = new vscode.TreeItem(`${label}  ${usageBar(percent)}  ${percent}%`);
-      item.tooltip = `${label}: ${percent}% used${value?.resets_at ? `\nResets in ${resetIn(value.resets_at)}` : ""}`;
+      const expired = value?.resets_at && value.resets_at * 1000 <= Date.now();
+      // Show what is LEFT, like the official Codex usage window does.
+      const left = Math.max(0, 100 - Math.round(value?.used_percent || 0));
+      const item = new vscode.TreeItem(
+        expired ? `${label}  no fresh data` : `${label}  ${usageBar(left)}  ${left}% left`
+      );
+      item.tooltip = expired
+        ? `${label}: this window restarted after the last local record. Send any message to Codex to update.`
+        : `${label}: ${left}% left${value?.resets_at ? `\nResets in ${resetIn(value.resets_at)}` : ""}`;
       item.iconPath = new vscode.ThemeIcon(
-        "circle-filled",
-        new vscode.ThemeColor(percent >= 90 ? "charts.red" : percent >= 70 ? "charts.yellow" : "charts.green")
+        expired ? "circle-outline" : "circle-filled",
+        expired
+          ? undefined
+          : new vscode.ThemeColor(left <= 10 ? "charts.red" : left <= 30 ? "charts.yellow" : "charts.green")
       );
       const reset = new vscode.TreeItem(" ");
-      reset.description = value?.resets_at ? `Resets in ${resetIn(value.resets_at)}` : "Reset time unavailable";
+      reset.description = expired
+        ? "Send any message to Codex to update"
+        : value?.resets_at ? `Resets in ${resetIn(value.resets_at)}` : "Reset time unavailable";
       reset.iconPath = new vscode.ThemeIcon("blank");
       return [item, reset];
     };
-    return [plan, ...makeLimit("Session (5hr)", limits.primary), ...makeLimit("Weekly (7 day)", limits.secondary)];
+    return [plan, updated, ...makeLimit("Session (5hr)", limits.primary), ...makeLimit("Weekly (7 day)", limits.secondary)];
   }
 }
 
